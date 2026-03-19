@@ -46,14 +46,29 @@ function getColorClasses(status: string): string {
   }
 }
 
+function Spinner({ small }: { small?: boolean }) {
+  return (
+    <svg
+      className={`inline-block animate-spin ${small ? 'w-3 h-3 mr-0.5' : 'w-3.5 h-3.5 mr-1'}`}
+      viewBox="0 0 24 24"
+      fill="none"
+    >
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
+  );
+}
+
 export function StatusBadge({ status, small }: StatusBadgeProps) {
   const colorClasses = getColorClasses(status);
+  const isLoading = status === StepStatus.BROADCASTING;
   return (
     <span
-      className={`inline-block border rounded font-semibold ${colorClasses} ${
+      className={`inline-flex items-center border rounded font-semibold ${colorClasses} ${
         small ? 'px-1.5 py-0.5 text-[10px]' : 'px-2 py-0.5 text-xs'
       }`}
     >
+      {isLoading && <Spinner small={small} />}
       {LABELS[status] ?? status}
     </span>
   );

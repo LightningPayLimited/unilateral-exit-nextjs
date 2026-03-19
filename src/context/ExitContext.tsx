@@ -6,8 +6,8 @@ import { BroadcastPhase, StepStatus } from '@/lib/types';
 import { parseTreeState } from '@/lib/tree-parser';
 import { broadcastTx, submitPackage, getTxStatus, getCurrentBlockHeight, getFeeRate, determinePhase, getNextStep } from '@/lib/broadcaster';
 import { saveState, loadState } from '@/lib/storage';
-import { buildCpfpTx, findAnchorVout, getTxVsize, fetchUtxos, getAddress, computeTxidFromHex } from '@/lib/wallet';
-import type { WalletState } from '@/lib/wallet';
+import { buildCpfpTx, buildAllCpfpPackages, findAnchorVout, getTxVsize, fetchUtxos, getAddress, computeTxidFromHex } from '@/lib/wallet';
+import type { WalletState, CpfpPackage } from '@/lib/wallet';
 
 const DEFAULT_MEMPOOL_URL = '/mempool';
 const DEFAULT_RPC_URL = '/rpc';
@@ -150,6 +150,7 @@ interface ExitContextValue {
   startBroadcast: (wallet: WalletState) => void;
   pause: () => void;
   retryStep: (stepId: string) => void;
+  bumpFee: (stepId: string) => void;
   clear: () => void;
 }
 
@@ -161,12 +162,20 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
   stateRef.current = state;
   const runningRef = useRef(false);
   const walletRef = useRef<WalletState | null>(null);
+  const cpfpPackagesRef = useRef<Map<string, CpfpPackage>>(new Map());
 
   // Load persisted state on mount
   useEffect(() => {
     loadState().then(saved => {
       if (saved) {
-        dispatch({ type: 'LOAD_STATE', state: { ...saved, isRunning: false } });
+        dispatch({ type: 'LOAD_STATE', state: {
+          ...saved,
+          isRunning: false,
+          mempoolBaseUrl: DEFAULT_MEMPOOL_URL,
+          rpcUrl: DEFAULT_RPC_URL,
+          rpcUser: DEFAULT_RPC_USER,
+          rpcPassword: DEFAULT_RPC_PASSWORD,
+        } });
       }
     });
   }, []);
@@ -293,14 +302,51 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
         }
 
         if (nextStep) {
-          // Refresh wallet UTXOs before building CPFP
-          if (walletRef.current) {
+          // Only refresh wallet UTXOs if we have none cached
+          if (walletRef.current && walletRef.current.utxos.length === 0) {
             try {
               const addr = getAddress(walletRef.current.mnemonic, walletRef.current.addressIndex);
               const freshUtxos = await fetchUtxos(addr, s.mempoolBaseUrl, s.rpcUrl, s.rpcUser, s.rpcPassword);
               walletRef.current = { ...walletRef.current, utxos: freshUtxos };
+              // Rebuild all CPFP packages with fresh UTXOs
+              cpfpPackagesRef.current = new Map();
             } catch {
               // Use cached UTXOs
+            }
+          }
+
+          // Pre-build CPFP packages for all pending steps if not already built
+          if (cpfpPackagesRef.current.size === 0 && walletRef.current && walletRef.current.utxos.length > 0) {
+            const currentState = stateRef.current;
+            const pendingSteps: { id: string; txHex: string }[] = [];
+            for (const t of s.trees) {
+              const tPhase = currentState.treePhases[t.treeId];
+              if (tPhase === BroadcastPhase.COMPLETE || tPhase === BroadcastPhase.ALREADY_EXITED) continue;
+              for (const st of t.steps) {
+                const stStatus = currentState.stepStatuses[st.id];
+                if (!stStatus || stStatus === StepStatus.PENDING || stStatus === StepStatus.FAILED) {
+                  pendingSteps.push({ id: st.id, txHex: st.txHex });
+                }
+              }
+            }
+            if (pendingSteps.length > 0) {
+              try {
+                const recommendedRate = await getFeeRate(s.mempoolBaseUrl);
+                const feeRate = Math.max(recommendedRate, 1);
+                const packages = buildAllCpfpPackages({
+                  mnemonic: walletRef.current.mnemonic,
+                  addressIndex: walletRef.current.addressIndex,
+                  steps: pendingSteps,
+                  fundingUtxos: walletRef.current.utxos,
+                  feeRate,
+                });
+                console.log(`[exit] pre-built ${packages.length} CPFP packages for ${pendingSteps.length} pending steps`);
+                for (const pkg of packages) {
+                  cpfpPackagesRef.current.set(pkg.stepId, pkg);
+                }
+              } catch (e) {
+                console.log(`[exit] failed to pre-build CPFP packages: ${e instanceof Error ? e.message : e}`);
+              }
             }
           }
 
@@ -310,65 +356,86 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
           // Try direct broadcast first to detect already-confirmed/in-mempool txs
           let result = await broadcastTx(nextStep.txHex, s.mempoolBaseUrl);
 
-          // If needs CPFP (zero-fee rejection), build and submit package
+          // If needs CPFP (zero-fee rejection), use pre-built package or build on-the-fly
           if (result.error === 'needs-cpfp') {
-            const wallet = walletRef.current;
-            if (!wallet || wallet.utxos.length === 0) {
-              console.log(`[exit] step ${nextStep.id} needs CPFP but no wallet UTXOs`);
-              result = { error: 'Needs CPFP: fund the wallet or wait for previous CPFP to confirm' };
-            } else {
-              console.log(`[exit] step ${nextStep.id} building CPFP package...`);
-            {
-              try {
-                const anchorVout = findAnchorVout(nextStep.txHex);
-                if (anchorVout === null) {
-                  dispatch({ type: 'STEP_FAILED', stepId: nextStep.id, error: 'No anchor output found in tx' });
+            const prebuilt = cpfpPackagesRef.current.get(nextStep.id);
+            if (prebuilt) {
+              console.log(`[exit] step ${nextStep.id} using pre-built CPFP package`);
+              const pkgResult = await submitPackage(
+                [prebuilt.parentTxHex, prebuilt.cpfpChildHex],
+                s.rpcUrl,
+                s.rpcUser,
+                s.rpcPassword,
+              );
+              cpfpPackagesRef.current.delete(nextStep.id);
+
+              // Handle partial success: parent accepted even if child failed
+              if (pkgResult.txids && pkgResult.txids.length > 0) {
+                result = { txid: pkgResult.txids[0] };
+                if (pkgResult.error) {
+                  console.log(`[exit] parent accepted, child issue: ${pkgResult.error}`);
+                }
+              } else if (pkgResult.error) {
+                if (pkgResult.error.includes('missingorspent')) {
+                  console.log('[exit] CPFP child inputs not yet available (waiting for previous CPFP to confirm)');
+                  result = { error: 'Waiting for previous CPFP to confirm' };
                 } else {
-                  const parentVsize = getTxVsize(nextStep.txHex);
-                  const recommendedRate = await getFeeRate(s.mempoolBaseUrl);
-                  const feeRate = Math.max(recommendedRate, 1);
-                  console.log(`[exit] anchor vout=${anchorVout} parentVsize=${parentVsize} feeRate=${feeRate} (recommended=${recommendedRate})`);
+                  result = { error: pkgResult.error };
+                }
+              }
+            } else {
+              // No pre-built package available, fall back to on-the-fly build
+              const wallet = walletRef.current;
+              if (!wallet || wallet.utxos.length === 0) {
+                console.log(`[exit] step ${nextStep.id} needs CPFP but no wallet UTXOs`);
+                result = { error: 'Needs CPFP: fund the wallet or wait for previous CPFP to confirm' };
+              } else {
+                try {
+                  const anchorVout = findAnchorVout(nextStep.txHex);
+                  if (anchorVout === null) {
+                    result = { error: 'No anchor output found in tx' };
+                  } else {
+                    const parentVsize = getTxVsize(nextStep.txHex);
+                    const recommendedRate = await getFeeRate(s.mempoolBaseUrl);
+                    const feeRate = Math.max(recommendedRate, 1);
 
-                  const cpfpHex = buildCpfpTx({
-                    mnemonic: wallet.mnemonic,
-                    addressIndex: wallet.addressIndex,
-                    parentTxHex: nextStep.txHex,
-                    anchorVout,
-                    fundingUtxos: wallet.utxos,
-                    feeRate,
-                    parentVsize,
-                  });
+                    const cpfpHex = buildCpfpTx({
+                      mnemonic: wallet.mnemonic,
+                      addressIndex: wallet.addressIndex,
+                      parentTxHex: nextStep.txHex,
+                      anchorVout,
+                      fundingUtxos: wallet.utxos,
+                      feeRate,
+                      parentVsize,
+                    });
 
-                  console.log(`[cpfp] parent hex: ${nextStep.txHex}`);
-                  console.log(`[cpfp] child hex: ${cpfpHex}`);
+                    const pkgResult = await submitPackage(
+                      [nextStep.txHex, cpfpHex],
+                      s.rpcUrl,
+                      s.rpcUser,
+                      s.rpcPassword,
+                    );
 
-                  const pkgResult = await submitPackage(
-                    [nextStep.txHex, cpfpHex],
-                    s.rpcUrl,
-                    s.rpcUser,
-                    s.rpcPassword,
-                  );
-
-                  if (pkgResult.error) {
-                    result = { error: pkgResult.error };
-                  } else if (pkgResult.txids && pkgResult.txids.length > 0) {
-                    result = { txid: pkgResult.txids[0] };
-                    if (walletRef.current) {
-                      const usedTxids = new Set(wallet.utxos.map(u => `${u.txid}:${u.vout}`));
-                      walletRef.current = {
-                        ...walletRef.current,
-                        utxos: walletRef.current.utxos.filter(u => !usedTxids.has(`${u.txid}:${u.vout}`)),
-                      };
-                      console.log(`[exit] wallet UTXOs remaining: ${walletRef.current.utxos.length}`);
+                    if (pkgResult.txids && pkgResult.txids.length > 0) {
+                      result = { txid: pkgResult.txids[0] };
+                      if (pkgResult.error) {
+                        console.log(`[exit] parent accepted, child issue: ${pkgResult.error}`);
+                      }
+                    } else if (pkgResult.error) {
+                      if (pkgResult.error.includes('missingorspent')) {
+                        if (walletRef.current) {
+                          walletRef.current = { ...walletRef.current, utxos: [] };
+                        }
+                      }
+                      result = { error: pkgResult.error };
                     }
                   }
+                } catch (e) {
+                  const msg = e instanceof Error ? e.message : 'CPFP build failed';
+                  console.log(`[exit] CPFP error: ${msg}`);
+                  result = { error: msg };
                 }
-              } catch (e) {
-                const msg = e instanceof Error ? e.message : 'CPFP build failed';
-                console.log(`[exit] CPFP error: ${msg}`);
-                result = { error: msg };
               }
-            }
             }
           }
 
@@ -403,6 +470,9 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
             console.log(`[exit] step ${nextStep.id} broadcast OK txid=${result.txid}`);
             dispatch({ type: 'STEP_BROADCAST', stepId: nextStep.id, txid: result.txid });
             didWork = true;
+            // After a successful CPFP submit, stop processing more trees this iteration.
+            // Chained packages depend on this CPFP confirming first.
+            break;
           }
         }
       }
@@ -415,6 +485,7 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
 
   const startBroadcast = useCallback((wallet: WalletState) => {
     walletRef.current = wallet;
+    cpfpPackagesRef.current = new Map(); // Force rebuild with fresh wallet UTXOs
     dispatch({ type: 'START_BROADCAST' });
     setTimeout(() => runBroadcastLoop(), 0);
   }, [runBroadcastLoop]);
@@ -439,8 +510,87 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
     }
   }, [state.trees, state.mempoolBaseUrl]);
 
+  const bumpFee = useCallback(async (stepId: string) => {
+    const step = state.trees.flatMap(t => t.steps).find(s => s.id === stepId);
+    if (!step) return;
+
+    const wallet = walletRef.current;
+    if (!wallet || wallet.utxos.length === 0) {
+      // Try loading wallet from storage
+      const loaded = await import('@/lib/wallet').then(m => m.loadWallet());
+      if (!loaded || loaded.utxos.length === 0) {
+        alert('No funded wallet available. Fund the wallet first, then refresh balance.');
+        return;
+      }
+      walletRef.current = loaded;
+    }
+
+    const w = walletRef.current!;
+    try {
+      const anchorVout = findAnchorVout(step.txHex);
+      if (anchorVout === null) {
+        alert('No anchor output found in this transaction.');
+        return;
+      }
+
+      const parentVsize = getTxVsize(step.txHex);
+      const recommendedRate = await getFeeRate(state.mempoolBaseUrl);
+      const feeRate = Math.max(recommendedRate, 1);
+
+      const cpfpHex = buildCpfpTx({
+        mnemonic: w.mnemonic,
+        addressIndex: w.addressIndex,
+        parentTxHex: step.txHex,
+        anchorVout,
+        fundingUtxos: w.utxos,
+        feeRate,
+        parentVsize,
+      });
+
+      console.log(`[bump] broadcasting CPFP child for step ${stepId}, feeRate=${feeRate}`);
+
+      // Parent is already in mempool, just broadcast the child directly
+      const result = await broadcastTx(cpfpHex, state.mempoolBaseUrl);
+      if (result.error) {
+        // If direct broadcast fails (e.g. needs package), try submitpackage
+        console.log(`[bump] direct child broadcast failed: ${result.error}, trying submitpackage`);
+        const pkgResult = await submitPackage(
+          [step.txHex, cpfpHex],
+          state.rpcUrl,
+          state.rpcUser,
+          state.rpcPassword,
+        );
+        // Handle partial success: parent accepted even if child failed
+        if (pkgResult.txids && pkgResult.txids.length > 0) {
+          const parentTxid = pkgResult.txids[0];
+          console.log(`[bump] parent tx accepted: ${parentTxid}${pkgResult.error ? ` (child issue: ${pkgResult.error})` : ''}`);
+          dispatch({ type: 'STEP_BROADCAST', stepId, txid: parentTxid });
+          const usedTxids = new Set(w.utxos.map(u => `${u.txid}:${u.vout}`));
+          walletRef.current = {
+            ...w,
+            utxos: w.utxos.filter(u => !usedTxids.has(`${u.txid}:${u.vout}`)),
+          };
+        } else if (pkgResult.error) {
+          alert(`Bump failed: ${pkgResult.error}`);
+        }
+      } else {
+        console.log(`[bump] CPFP child broadcast OK: ${result.txid}`);
+        const usedTxids = new Set(w.utxos.map(u => `${u.txid}:${u.vout}`));
+        walletRef.current = {
+          ...w,
+          utxos: w.utxos.filter(u => !usedTxids.has(`${u.txid}:${u.vout}`)),
+        };
+        if (result.txid) {
+          dispatch({ type: 'STEP_BROADCAST', stepId, txid: result.txid });
+        }
+      }
+    } catch (e) {
+      alert(`Bump failed: ${e instanceof Error ? e.message : 'Unknown error'}`);
+    }
+  }, [state.trees, state.mempoolBaseUrl, state.rpcUrl, state.rpcUser, state.rpcPassword]);
+
   return (
-    <ExitContext.Provider value={{ state, importData, startBroadcast, pause, retryStep, clear }}>
+    <ExitContext.Provider value={{ state, importData, startBroadcast, pause, retryStep, bumpFee, clear }}>
       {children}
     </ExitContext.Provider>
   );

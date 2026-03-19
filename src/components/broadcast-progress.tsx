@@ -14,7 +14,7 @@ interface BroadcastProgressProps {
 }
 
 export function BroadcastProgress({ tree, index }: BroadcastProgressProps) {
-  const { state, retryStep } = useExit();
+  const { state, retryStep, bumpFee } = useExit();
   const [expanded, setExpanded] = useState(false);
 
   const phase = state.treePhases[tree.treeId] === BroadcastPhase.ALREADY_EXITED
@@ -95,26 +95,38 @@ export function BroadcastProgress({ tree, index }: BroadcastProgressProps) {
 
       {expanded && (
         <div className="mt-2 border-t border-zinc-700 pt-1">
-          {tree.steps.map(step => (
-            <button
-              key={step.id}
-              className="w-full text-left"
-              onClick={() => {
-                if (state.stepStatuses[step.id] === StepStatus.FAILED) {
-                  retryStep(step.id);
-                }
-              }}
-            >
-              <LeafRow
-                step={step}
-                status={state.stepStatuses[step.id] ?? StepStatus.PENDING}
-                txid={state.stepTxids[step.id]}
-                error={state.stepErrors[step.id]}
-                csvTarget={state.csvTargetHeights[step.id]}
-                currentHeight={state.currentBlockHeight}
-              />
-            </button>
-          ))}
+          {tree.steps.map(step => {
+            const stepStatus = state.stepStatuses[step.id] ?? StepStatus.PENDING;
+            return (
+              <div key={step.id}>
+                <button
+                  className="w-full text-left"
+                  onClick={() => {
+                    if (stepStatus === StepStatus.FAILED) {
+                      retryStep(step.id);
+                    }
+                  }}
+                >
+                  <LeafRow
+                    step={step}
+                    status={stepStatus}
+                    txid={state.stepTxids[step.id]}
+                    error={state.stepErrors[step.id]}
+                    csvTarget={state.csvTargetHeights[step.id]}
+                    currentHeight={state.currentBlockHeight}
+                  />
+                </button>
+                {stepStatus === StepStatus.BROADCAST && (
+                  <button
+                    className="text-[11px] text-amber-500 hover:text-amber-400 ml-1 mb-1"
+                    onClick={() => bumpFee(step.id)}
+                  >
+                    Bump Fee (CPFP)
+                  </button>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
 

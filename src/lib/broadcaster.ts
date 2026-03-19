@@ -156,12 +156,23 @@ export async function submitPackage(
         return { txids };
       }
 
+      // Partial success: collect accepted txids and errors separately
+      const accepted: string[] = [];
       const errors: string[] = [];
       for (const [wtxid, result] of Object.entries(txResults) as [string, any][]) {
         if (result.error) {
           errors.push(`${result.txid?.slice(0, 12) || wtxid.slice(0, 12)}: ${result.error}`);
+        } else if (result.txid) {
+          accepted.push(result.txid);
         }
       }
+
+      // If the parent tx was accepted (first tx in package), report partial success
+      if (accepted.length > 0) {
+        console.log(`[submitpackage] partial success: accepted=${accepted.join(', ')}, errors=${errors.join('; ')}`);
+        return { txids: accepted, error: errors.length > 0 ? `Child failed: ${errors.join('; ')}` : undefined };
+      }
+
       const errorMsg = errors.length > 0
         ? `Package failed: ${errors.join('; ')}`
         : `Package rejected: ${packageMsg}`;
