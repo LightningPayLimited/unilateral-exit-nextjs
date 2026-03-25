@@ -4,9 +4,10 @@ import React, { createContext, useContext, useReducer, useEffect, useCallback, u
 import type { UniexitData, BroadcastTree, ExitState } from '@/lib/types';
 import { BroadcastPhase, StepStatus } from '@/lib/types';
 import { parseTreeState } from '@/lib/tree-parser';
-import { broadcastTx, submitPackage, getTxStatus, getCurrentBlockHeight, getFeeRate, determinePhase, getNextStep } from '@/lib/broadcaster';
+import { broadcastTx, submitPackage, getTxStatus, getCurrentBlockHeight, getFeeRate, determinePhase, getNextStep, checkOutspend } from '@/lib/broadcaster';
 import { saveState, loadState } from '@/lib/storage';
 import { buildCpfpTx, buildAllCpfpPackages, findAnchorVout, getTxVsize, fetchUtxos, getAddress, computeTxidFromHex } from '@/lib/wallet';
+import { parseTx } from '@/lib/tx-parser';
 import type { WalletState, CpfpPackage } from '@/lib/wallet';
 
 const DEFAULT_MEMPOOL_URL = '/mempool';
@@ -41,8 +42,9 @@ type Action =
   | { type: 'STEP_FAILED'; stepId: string; error: string }
   | { type: 'STEP_WAITING_CSV'; stepId: string; targetHeight: number }
   | { type: 'UPDATE_BLOCK_HEIGHT'; height: number }
+  | { type: 'TREE_PHASE_UPDATE'; treeId: string; phase: BroadcastPhase }
   | { type: 'TREE_COMPLETE'; treeId: string }
-  | { type: 'TREE_ALREADY_EXITED'; treeId: string }
+  | { type: 'TREE_ALREADY_EXITED'; treeId: string; txids?: Record<string, string> }
   | { type: 'CLEAR' };
 
 function reducer(state: ExitState, action: Action): ExitState {
@@ -114,6 +116,12 @@ function reducer(state: ExitState, action: Action): ExitState {
     case 'UPDATE_BLOCK_HEIGHT':
       return { ...state, currentBlockHeight: action.height };
 
+    case 'TREE_PHASE_UPDATE':
+      return {
+        ...state,
+        treePhases: { ...state.treePhases, [action.treeId]: action.phase },
+      };
+
     case 'TREE_COMPLETE': {
       return {
         ...state,
@@ -123,16 +131,21 @@ function reducer(state: ExitState, action: Action): ExitState {
 
     case 'TREE_ALREADY_EXITED': {
       const newStatuses = { ...state.stepStatuses };
+      const newTxids = { ...state.stepTxids };
       const tree = state.trees.find(t => t.treeId === action.treeId);
       if (tree) {
         for (const step of tree.steps) {
           newStatuses[step.id] = StepStatus.CONFIRMED;
+          if (action.txids && action.txids[step.id]) {
+            newTxids[step.id] = action.txids[step.id];
+          }
         }
       }
       return {
         ...state,
         treePhases: { ...state.treePhases, [action.treeId]: BroadcastPhase.ALREADY_EXITED },
         stepStatuses: newStatuses,
+        stepTxids: newTxids,
       };
     }
 
@@ -190,13 +203,50 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
   // Update tree phases whenever step statuses change
   useEffect(() => {
     for (const tree of state.trees) {
+      if (state.treePhases[tree.treeId] === BroadcastPhase.ALREADY_EXITED) continue;
       const newPhase = determinePhase(tree, state.stepStatuses);
-      if (state.treePhases[tree.treeId] !== newPhase &&
-          state.treePhases[tree.treeId] !== BroadcastPhase.ALREADY_EXITED) {
-        dispatch({ type: 'TREE_COMPLETE', treeId: tree.treeId });
+      if (state.treePhases[tree.treeId] !== newPhase) {
+        dispatch({ type: 'TREE_PHASE_UPDATE', treeId: tree.treeId, phase: newPhase });
       }
     }
-  }, [state.stepStatuses, state.trees]);
+  }, [state.stepStatuses, state.trees, state.treePhases]);
+
+  // Look up on-chain txids for already-exited trees that are missing txids
+  useEffect(() => {
+    for (const tree of state.trees) {
+      if (state.treePhases[tree.treeId] !== BroadcastPhase.ALREADY_EXITED) continue;
+      const leafStep = tree.steps.find(st => st.type === 'leaf-node');
+      const refundStep = tree.steps.find(st => st.type === 'leaf-refund');
+      if (leafStep && state.stepTxids[leafStep.id] && refundStep && state.stepTxids[refundStep.id]) continue;
+      // Missing txids — look them up
+      (async () => {
+        try {
+          const parsed = parseTx(leafStep!.txHex);
+          const inp = parsed.inputs[0];
+          const leafOutspend = await checkOutspend(inp.prevTxid, inp.prevVout, state.mempoolBaseUrl);
+          const txids: Record<string, string> = {};
+          if (leafOutspend.spent && leafOutspend.spendingTxid) {
+            if (leafStep) txids[leafStep.id] = leafOutspend.spendingTxid;
+            const refundOutspend = await checkOutspend(leafOutspend.spendingTxid, 0, state.mempoolBaseUrl);
+            if (refundOutspend.spent && refundOutspend.spendingTxid && refundStep) {
+              txids[refundStep.id] = refundOutspend.spendingTxid;
+            }
+          }
+          // Store intermediate txids we already have
+          for (const st of tree.steps) {
+            if (st.type === 'intermediate' && state.stepTxids[st.id]) {
+              txids[st.id] = state.stepTxids[st.id];
+            }
+          }
+          if (Object.keys(txids).length > 0) {
+            dispatch({ type: 'TREE_ALREADY_EXITED', treeId: tree.treeId, txids });
+          }
+        } catch (e) {
+          console.log(`[exit] could not look up exit txids for ${tree.treeId.slice(0,8)}: ${e instanceof Error ? e.message : e}`);
+        }
+      })();
+    }
+  }, [state.trees, state.treePhases]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const importData = useCallback((data: UniexitData) => {
     const trees = parseTreeState(data);
@@ -324,7 +374,7 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
               if (tPhase === BroadcastPhase.COMPLETE || tPhase === BroadcastPhase.ALREADY_EXITED) continue;
               for (const st of t.steps) {
                 const stStatus = currentState.stepStatuses[st.id];
-                if (!stStatus || stStatus === StepStatus.PENDING || stStatus === StepStatus.FAILED) {
+                if (!stStatus || stStatus === StepStatus.PENDING || stStatus === StepStatus.FAILED || stStatus === StepStatus.WAITING_CSV) {
                   pendingSteps.push({ id: st.id, txHex: st.txHex });
                 }
               }
@@ -356,8 +406,10 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
           // Try direct broadcast first to detect already-confirmed/in-mempool txs
           let result = await broadcastTx(nextStep.txHex, s.mempoolBaseUrl);
 
-          // If needs CPFP (zero-fee rejection), use pre-built package or build on-the-fly
-          if (result.error === 'needs-cpfp') {
+          // If needs CPFP (zero-fee rejection or ambiguous -25), use pre-built package or build on-the-fly.
+          // The mempool API returns bare {"code":-25} without the message, so 'missing-inputs'
+          // may actually be 'non-BIP68-final' or a fee rejection. submitpackage gives proper errors.
+          if (result.error === 'needs-cpfp' || result.error === 'missing-inputs') {
             const prebuilt = cpfpPackagesRef.current.get(nextStep.id);
             if (prebuilt) {
               console.log(`[exit] step ${nextStep.id} using pre-built CPFP package`);
@@ -376,9 +428,15 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
                   console.log(`[exit] parent accepted, child issue: ${pkgResult.error}`);
                 }
               } else if (pkgResult.error) {
-                if (pkgResult.error.includes('missingorspent')) {
+                // Determine if it's the parent tx or just the CPFP child that failed
+                const parentTxFailed = pkgResult.error.includes(prebuilt.parentTxHex.slice(0, 12)) ||
+                  pkgResult.error.split(';').length > 1; // both txs failed = parent inputs missing
+                if (pkgResult.error.includes('missingorspent') && !parentTxFailed) {
                   console.log('[exit] CPFP child inputs not yet available (waiting for previous CPFP to confirm)');
                   result = { error: 'Waiting for previous CPFP to confirm' };
+                } else if (pkgResult.error.includes('missingorspent') && parentTxFailed) {
+                  console.log(`[exit] parent tx inputs missing on-chain — intermediate output may have been spent`);
+                  result = { error: 'missing-inputs' };
                 } else {
                   result = { error: pkgResult.error };
                 }
@@ -451,8 +509,58 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
             dispatch({ type: 'STEP_CONFIRMED', stepId: nextStep.id, blockHeight: currentState.currentBlockHeight });
             didWork = true;
           } else if (result.error === 'missing-inputs') {
-            console.log(`[exit] step ${nextStep.id} failed: inputs not found on-chain`);
-            dispatch({ type: 'STEP_FAILED', stepId: nextStep.id, error: 'Inputs not found on-chain' });
+            // Check if the inputs were already spent (cooperative close)
+            let alreadyExited = false;
+            try {
+              const parsed = parseTx(nextStep.txHex);
+              for (const inp of parsed.inputs) {
+                console.log(`[exit] step ${nextStep.id} spends ${inp.prevTxid}:${inp.prevVout}`);
+                const outspend = await checkOutspend(inp.prevTxid, inp.prevVout, s.mempoolBaseUrl);
+                if (outspend.spent) {
+                  console.log(`[exit] input ${inp.prevTxid}:${inp.prevVout} already spent by ${outspend.spendingTxid} at block ${outspend.spendingBlockHeight} — tree already exited`);
+                  alreadyExited = true;
+                } else {
+                  console.log(`[exit] input ${inp.prevTxid}:${inp.prevVout} is NOT spent — UTXO may not exist`);
+                }
+              }
+            } catch (e) {
+              console.log(`[exit] could not check outspends: ${e instanceof Error ? e.message : e}`);
+            }
+            if (alreadyExited) {
+              console.log(`[exit] tree ${tree.treeId.slice(0,8)} already exited (inputs spent by another tx)`);
+              // Look up the full chain of on-chain txids for display
+              const exitTxids: Record<string, string> = {};
+              try {
+                const parsed = parseTx(nextStep.txHex);
+                const inp = parsed.inputs[0];
+                // The spending tx of the intermediate output is the leaf-node tx
+                const leafOutspend = await checkOutspend(inp.prevTxid, inp.prevVout, s.mempoolBaseUrl);
+                if (leafOutspend.spent && leafOutspend.spendingTxid) {
+                  const leafTxid = leafOutspend.spendingTxid;
+                  // Find leaf-node step and store its txid
+                  const leafStep = tree.steps.find(st => st.type === 'leaf-node');
+                  if (leafStep) exitTxids[leafStep.id] = leafTxid;
+                  // Check if the leaf output was spent (refund tx)
+                  const refundOutspend = await checkOutspend(leafTxid, 0, s.mempoolBaseUrl);
+                  if (refundOutspend.spent && refundOutspend.spendingTxid) {
+                    const refundStep = tree.steps.find(st => st.type === 'leaf-refund');
+                    if (refundStep) exitTxids[refundStep.id] = refundOutspend.spendingTxid;
+                  }
+                }
+                // Also store intermediate txids from what we already have
+                for (const st of tree.steps) {
+                  if (st.type === 'intermediate' && currentState.stepTxids[st.id]) {
+                    exitTxids[st.id] = currentState.stepTxids[st.id];
+                  }
+                }
+              } catch (e) {
+                console.log(`[exit] could not look up exit txids: ${e instanceof Error ? e.message : e}`);
+              }
+              dispatch({ type: 'TREE_ALREADY_EXITED', treeId: tree.treeId, txids: exitTxids });
+              didWork = true;
+            } else {
+              dispatch({ type: 'STEP_FAILED', stepId: nextStep.id, error: 'Inputs not found on-chain' });
+            }
           } else if (result.error === 'csv-not-elapsed') {
             console.log(`[exit] step ${nextStep.id} CSV not elapsed`);
             dispatch({
@@ -496,17 +604,19 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const retryStep = useCallback((stepId: string) => {
-    dispatch({ type: 'STEP_FAILED', stepId, error: '' });
-    dispatch({ type: 'STEP_BROADCASTING', stepId });
+    // Reset the step to PENDING so the broadcast loop picks it up
+    // with full CPFP and error handling logic
     const step = state.trees.flatMap(t => t.steps).find(s => s.id === stepId);
     if (step) {
-      broadcastTx(step.txHex, state.mempoolBaseUrl).then(result => {
-        if (result.error) {
-          dispatch({ type: 'STEP_FAILED', stepId, error: result.error });
-        } else if (result.txid) {
-          dispatch({ type: 'STEP_BROADCAST', stepId, txid: result.txid });
-        }
-      });
+      dispatch({ type: 'STEP_FAILED', stepId, error: '' });
+      if (step.csvBlocks > 0 && state.currentBlockHeight > 0) {
+        // Re-enter WAITING_CSV — the loop will check if CSV elapsed and broadcast
+        dispatch({
+          type: 'STEP_WAITING_CSV',
+          stepId,
+          targetHeight: state.csvTargetHeights[stepId] ?? state.currentBlockHeight,
+        });
+      }
     }
   }, [state.trees, state.mempoolBaseUrl]);
 

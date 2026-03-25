@@ -189,6 +189,41 @@ export async function submitPackage(
 }
 
 /**
+ * Check if a transaction's outputs have been spent.
+ * Returns the spending txid if the specified output is spent, null otherwise.
+ */
+export async function checkOutspend(
+  txid: string,
+  vout: number,
+  baseUrl: string = DEFAULT_MEMPOOL_URL,
+): Promise<{ spent: boolean; spendingTxid?: string; spendingBlockHeight?: number }> {
+  // Try local proxy first, then fall back to mempool.space
+  const urls = [baseUrl, 'https://mempool.space'];
+  for (const url of urls) {
+    try {
+      const response = await fetch(`${url}/api/tx/${txid}/outspends`);
+      if (!response.ok) {
+        console.log(`[outspend] ${url} returned ${response.status} for ${txid}`);
+        continue;
+      }
+      const data = await response.json();
+      if (data[vout] && data[vout].spent) {
+        return {
+          spent: true,
+          spendingTxid: data[vout].txid,
+          spendingBlockHeight: data[vout].status?.block_height,
+        };
+      }
+      return { spent: false };
+    } catch (e) {
+      console.log(`[outspend] ${url} failed for ${txid}: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+  return { spent: false };
+
+}
+
+/**
  * Get recommended fee rate from mempool.space.
  */
 export async function getFeeRate(

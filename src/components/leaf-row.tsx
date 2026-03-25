@@ -4,7 +4,7 @@ import { StatusBadge } from '@/components/status-badge';
 import type { BroadcastStep } from '@/lib/types';
 import { StepStatus } from '@/lib/types';
 
-const MEMPOOL_URL = process.env.NEXT_PUBLIC_MEMPOOL_HOST ?? 'http://127.0.0.1:3006';
+const MEMPOOL_URL = process.env.NEXT_PUBLIC_MEMPOOL_EXPLORER ?? 'https://mempool.space';
 
 interface LeafRowProps {
   step: BroadcastStep;

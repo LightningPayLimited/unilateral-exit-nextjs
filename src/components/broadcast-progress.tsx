@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { StatusBadge } from '@/components/status-badge';
 import { LeafRow } from '@/components/leaf-row';
+import { SweepPanel } from '@/components/sweep-panel';
 import { determinePhase } from '@/lib/broadcaster';
 import type { BroadcastTree } from '@/lib/types';
 import { StepStatus, BroadcastPhase } from '@/lib/types';
@@ -134,6 +135,10 @@ export function BroadcastProgress({ tree, index }: BroadcastProgressProps) {
         <p className="text-[11px] text-red-500 mt-1.5">
           {failedSteps.length} failed step{failedSteps.length > 1 ? 's' : ''} - click to expand
         </p>
+      )}
+
+      {(phase === BroadcastPhase.COMPLETE || phase === BroadcastPhase.ALREADY_EXITED) && (
+        <SweepPanel tree={tree} />
       )}
     </div>
   );
