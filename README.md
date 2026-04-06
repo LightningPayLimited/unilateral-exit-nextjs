@@ -25,7 +25,7 @@ The exit process works in stages:
 - **A Mempool/Esplora instance** (for transaction broadcasting and chain queries, or uses the public mempool.space as fallback)
 - **Your Spark wallet mnemonic** (the seed phrase from your Spark/Breez SDK wallet)
 - **The exit JSON file** exported from your Spark wallet containing `identityPublicKey`, `leaves`, and `serializedNodes`
-- **Some more onchain Bitcoin** to pay for the CPFP transactions that will need to be broadcast
+- **Some more onchain Bitcoin** to pay the fee for the CPFP transactions that will need to be broadcast
 
 ## Getting Started
 
