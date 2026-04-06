@@ -5,7 +5,7 @@ A Next.js application for recovering funds from Stacked Wallet - which is using 
 ## Warning - this process is not for the faint hearted
 
 This process while automated is a "break glass in case of emergency" escape hatch from the Spark system, you need a decent level of technical knowledge on whats going on. 
-For leaf backup efficiency reasons the only leaves that are exited are those worth > 16k sats, so depending on how much Bitcoin are in your wallet and the leaf distribution you will likely get some high % of your funds out but not all, the more Bitcoin you have in your wallet the higher the % you will be able to exit. If you only have a small amount in your wallet you might not get any out.
+For leaf backup efficiency reasons the only leaves that are exited are those worth > 16k sats, so depending on how much Bitcoin are in your wallet and the leaf distribution you will likely get some high % of your funds out but not all, the more Bitcoin you have in your wallet the higher the % you will be able to exit. If you only have a small amount in your wallet you might not get any out. It can also take over 2 weeks to exit all the leaves depending on their relative timelocks
 
 ## What is a Unilateral Exit?
 
