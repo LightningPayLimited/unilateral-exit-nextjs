@@ -1,6 +1,11 @@
-# Spark Unilateral Exit Tool
+# Stacked Wallet - Spark Unilateral Exit Tool
 
-A Next.js application for recovering funds from a [Spark](https://github.com/buildonspark/spark) Bitcoin Layer 2 wallet through unilateral exit. This tool broadcasts the pre-signed exit transaction chain on-chain when the Spark service is unavailable or unresponsive, and sweeps the recovered funds to a Bitcoin address you control.
+A Next.js application for recovering funds from Stacked Wallet - which is using [Spark](https://github.com/buildonspark/spark) through unilateral exit. This tool broadcasts the pre-signed exit transaction chain on-chain when the Spark service is unavailable or unresponsive, and sweeps the recovered funds to a Bitcoin address you control.
+
+## Warning - this process is not for the faint hearted
+
+This process while automated is a "break glass in case of emergency" escape hatch from the Spark system, you need a decent level of technical knowledge on whats going on. 
+For leaf backup efficiency reasons the only leaves that are exited are those worth > 16k sats, so depending on how much Bitcoin are in your wallet and the leaf distribution you will likely get some high % of your funds out but not all, the more Bitcoin you have in your wallet the higher the % you will be able to exit. If you only have a small amount in your wallet you might not get any out. It can also take over 2 weeks to exit all the leaves depending on their relative timelocks
 
 ## What is a Unilateral Exit?
 
@@ -19,7 +24,8 @@ The exit process works in stages:
 - **A Bitcoin Core node** (for `submitpackage` RPC, used for CPFP fee bumping of zero-fee TRUC transactions)
 - **A Mempool/Esplora instance** (for transaction broadcasting and chain queries, or uses the public mempool.space as fallback)
 - **Your Spark wallet mnemonic** (the seed phrase from your Spark/Breez SDK wallet)
-- **The exit JSON file** exported from your Spark wallet containing `identityPublicKey`, `leaves`, and `serializedNodes`
+- **The exit JSON file** exported from your Spark wallet containing `identityPublicKey`, `leaves`, and `serializedNodes` - Download this file from Balance Screen > Settings > Unilateral Exit
+- **Some more onchain Bitcoin** to pay the fee for the CPFP transactions that will need to be broadcast
 
 ## Getting Started
 
