@@ -43,38 +43,56 @@ export async function POST(req: NextRequest) {
     if (pub === protoIdentity) matchedAccount = account;
   }
 
-  // If matched, verify signing key and leaf derivation
+  // If matched, verify signing key and leaf derivation. Try multiple hash-input
+  // variants because we don't know which encoding the SDK used for sha256.
   let signingKeyMatch = false;
+  let matchedHashVariant: string | null = null;
   let leafDerivationResult: Record<string, unknown> | null = null;
   if (matchedAccount !== null) {
     const signingKey = root.derive(`m/8797555'/${matchedAccount}'/1'`);
 
-    // Try all leaf nodes
-    for (const [nodeId, hex] of Object.entries(serializedNodes)) {
+    const hashVariantBytes = (id: string): { label: string; bytes: Buffer }[] => {
+      const variants: { label: string; bytes: Buffer }[] = [
+        { label: 'utf8', bytes: Buffer.from(id, 'utf8') },
+        { label: 'utf8-nodashes', bytes: Buffer.from(id.replace(/-/g, ''), 'utf8') },
+      ];
+      const stripped = id.replace(/-/g, '');
+      if (/^[0-9a-fA-F]{32}$/.test(stripped)) {
+        variants.push({ label: 'uuid-bytes', bytes: Buffer.from(stripped, 'hex') });
+      }
+      return variants;
+    };
+
+    outer: for (const [, hex] of Object.entries(serializedNodes)) {
       const node = TreeNodeCodec.decode(hexToBytes(hex as string));
       const nodeProtoSigning = bytesToHex(node.ownerSigningPublicKey);
+      if (!nodeProtoSigning) continue;
 
-      const hash = createHash('sha256').update(node.id).digest();
-      const leafChild = hash.readUInt32BE(0) % 0x80000000;
-      const childKey = signingKey.deriveChild(leafChild + 0x80000000);
-      const childPub = Buffer.from(childKey.publicKey!).toString('hex');
+      for (const { label, bytes } of hashVariantBytes(node.id)) {
+        const hash = createHash('sha256').update(bytes).digest();
+        const leafChild = hash.readUInt32BE(0) % 0x80000000;
+        const childKey = signingKey.deriveChild(leafChild + 0x80000000);
+        const childPub = Buffer.from(childKey.publicKey!).toString('hex');
 
-      if (childPub === nodeProtoSigning) {
-        signingKeyMatch = true;
-        const xOnly = toXOnly(childKey.publicKey!);
-        const p2tr = btc.p2tr(xOnly);
-        const outputKey = Buffer.from(p2tr.script.slice(2)).toString('hex');
+        if (childPub === nodeProtoSigning) {
+          signingKeyMatch = true;
+          matchedHashVariant = label;
+          const xOnly = toXOnly(childKey.publicKey!);
+          const p2tr = btc.p2tr(xOnly);
+          const outputKey = Buffer.from(p2tr.script.slice(2)).toString('hex');
 
-        leafDerivationResult = {
-          nodeId: node.id,
-          leafChild,
-          path: `m/8797555'/${matchedAccount}'/1'/${leafChild}'`,
-          derivedSigningPub: childPub,
-          protoSigningPub: nodeProtoSigning,
-          signingMatch: true,
-          taprootOutputKey: outputKey,
-        };
-        break;
+          leafDerivationResult = {
+            nodeId: node.id,
+            hashVariant: label,
+            leafChild,
+            path: `m/8797555'/${matchedAccount}'/1'/${leafChild}'`,
+            derivedSigningPub: childPub,
+            protoSigningPub: nodeProtoSigning,
+            signingMatch: true,
+            taprootOutputKey: outputKey,
+          };
+          break outer;
+        }
       }
     }
   }
@@ -85,6 +103,7 @@ export async function POST(req: NextRequest) {
     protoIdentityPub: protoIdentity,
     protoSigningPub: protoSigning,
     signingKeyMatch,
+    matchedHashVariant,
     leafDerivation: leafDerivationResult,
   });
 }

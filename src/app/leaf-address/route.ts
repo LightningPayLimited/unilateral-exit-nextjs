@@ -4,6 +4,9 @@ import { mnemonicToSeedSync, validateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
 import { createHash } from 'crypto';
 import * as btc from '@scure/btc-signer';
+import { TreeNodeCodec } from '@/lib/proto/tree-node';
+import { hexToBytes, bytesToHex } from '@/lib/hex-utils';
+import { computeTxid } from '@/lib/tx-parser';
 
 const HARDENED = 0x80000000;
 
@@ -36,7 +39,7 @@ function hashInputVariants(leafId: string): { label: string; bytes: Buffer }[] {
 // expect a single address.
 export async function POST(req: NextRequest) {
   try {
-    const { mnemonic, leafId, account } = await req.json();
+    const { mnemonic, leafId, account, serializedNodes } = await req.json();
     if (!mnemonic || !validateMnemonic(mnemonic, wordlist)) {
       return NextResponse.json({ error: 'valid mnemonic required' }, { status: 400 });
     }
@@ -67,6 +70,22 @@ export async function POST(req: NextRequest) {
 
     const primary = candidates.find(c => c.variant === 'utf8' && 'address' in c);
 
+    // If serializedNodes is provided, also compute the refund tx id from the
+    // pre-signed refund tx hex. This lets the sweep flow look up the refund
+    // tx directly by id (bypassing the address indexer entirely).
+    let refundTxid: string | undefined;
+    let refundOutputValue: number | undefined;
+    if (serializedNodes && serializedNodes[leafId]) {
+      try {
+        const node = TreeNodeCodec.decode(hexToBytes(serializedNodes[leafId]));
+        const refundHex = bytesToHex(node.refundTx);
+        refundTxid = await computeTxid(refundHex);
+        refundOutputValue = node.value;
+      } catch {
+        // ignore
+      }
+    }
+
     return NextResponse.json({
       // Backwards-compat single-address fields (utf8 variant)
       address: primary && 'address' in primary ? primary.address : undefined,
@@ -74,6 +93,9 @@ export async function POST(req: NextRequest) {
       tweakedOutputKey: primary && 'tweakedOutputKey' in primary ? primary.tweakedOutputKey : undefined,
       // Full list of candidates the caller can iterate
       candidates,
+      // Computed refund tx info (only if serializedNodes was passed)
+      refundTxid,
+      refundOutputValue,
     });
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : 'error' }, { status: 500 });
