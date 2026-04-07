@@ -62,6 +62,17 @@ export enum StepStatus {
   FAILED = 'FAILED',
 }
 
+// Per-tree info recorded when a tree is detected as already-exited
+// (e.g. cooperatively closed by Spark before we could broadcast).
+export interface CoopExitInfo {
+  // The tree input we tried to spend
+  prevTxid: string;
+  prevVout: number;
+  // The tx that actually consumed it on-chain
+  spendingTxid: string;
+  spendingBlockHeight?: number;
+}
+
 // Persisted state
 export interface ExitState {
   importedData: UniexitData | null;
@@ -72,6 +83,7 @@ export interface ExitState {
   stepErrors: Record<string, string>;
   csvTargetHeights: Record<string, number>;
   currentBlockHeight: number;
+  coopExitInfo: Record<string, CoopExitInfo>; // keyed by treeId
   isRunning: boolean;
   mempoolBaseUrl: string;
   rpcUrl: string;

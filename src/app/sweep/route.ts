@@ -8,9 +8,27 @@ import { hex } from '@scure/base';
 
 const HARDENED = 0x80000000;
 
+// Same enumeration as /leaf-address — keep these in sync.
+function leafIdHashBytes(leafId: string, variant: string): Buffer {
+  switch (variant) {
+    case 'utf8-nodashes':
+      return Buffer.from(leafId.replace(/-/g, ''), 'utf8');
+    case 'uuid-bytes': {
+      const stripped = leafId.replace(/-/g, '');
+      if (!/^[0-9a-fA-F]{32}$/.test(stripped)) {
+        throw new Error('uuid-bytes variant requires a 32-hex-char leafId');
+      }
+      return Buffer.from(stripped, 'hex');
+    }
+    case 'utf8':
+    default:
+      return Buffer.from(leafId, 'utf8');
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const { mnemonic, leafId, account, destinationAddress, utxoTxid, utxoVout, utxoValue, feeRate, dryRun } = await req.json();
+    const { mnemonic, leafId, account, destinationAddress, utxoTxid, utxoVout, utxoValue, feeRate, dryRun, hashVariant } = await req.json();
 
     if (!mnemonic || !validateMnemonic(mnemonic, wordlist)) {
       return NextResponse.json({ error: 'valid mnemonic required' }, { status: 400 });
@@ -23,7 +41,8 @@ export async function POST(req: NextRequest) {
     const seed = mnemonicToSeedSync(mnemonic);
     const root = HDKey.fromMasterSeed(seed);
     const signingKey = root.derive(`m/8797555'/${account}'/1'`);
-    const hash = createHash('sha256').update(leafId).digest();
+    const variant = (typeof hashVariant === 'string' && hashVariant) || 'utf8';
+    const hash = createHash('sha256').update(leafIdHashBytes(leafId, variant)).digest();
     const leafChild = hash.readUInt32BE(0) % HARDENED;
     const childKey = signingKey.deriveChild(leafChild + HARDENED);
 
@@ -72,6 +91,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       sourceOutputKey,
       leafPath: `m/8797555'/${account}'/1'/${leafChild}'`,
+      hashVariant: variant,
       utxoValue,
       fee,
       feeRate: rate,

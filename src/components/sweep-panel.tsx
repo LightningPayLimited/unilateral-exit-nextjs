@@ -1,9 +1,40 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { BroadcastTree } from '@/lib/types';
+import { BroadcastPhase } from '@/lib/types';
+import { useExit } from '@/context/ExitContext';
 
 const MEMPOOL_EXPLORER = process.env.NEXT_PUBLIC_MEMPOOL_EXPLORER ?? 'https://mempool.space';
+const PUBLIC_MEMPOOL_API = 'https://mempool.space/api';
+
+// Look up UTXOs for an address. Tries public mempool.space first (which has
+// the full address index), then falls back to the local proxied mempool for
+// users running their own indexer. Public-first ordering keeps the dev console
+// quiet for users whose local mempool doesn't have an address index.
+async function fetchAddressUtxos(addr: string): Promise<
+  | { ok: true; utxos: Array<{ txid: string; vout: number; value: number }>; source: string }
+  | { ok: false; status: number; source: string }
+> {
+  const sources: Array<{ url: string; label: string }> = [
+    { url: `${PUBLIC_MEMPOOL_API}/address/${addr}/utxo`, label: 'mempool.space' },
+    { url: `/mempool/api/address/${addr}/utxo`, label: 'local mempool' },
+  ];
+  let lastStatus = 0;
+  for (const { url, label } of sources) {
+    try {
+      const res = await fetch(url);
+      if (res.ok) {
+        const utxos = await res.json();
+        if (Array.isArray(utxos)) return { ok: true, utxos, source: label };
+      }
+      lastStatus = res.status;
+    } catch {
+      // network error, try next source
+    }
+  }
+  return { ok: false, status: lastStatus, source: 'all sources' };
+}
 
 interface SweepPanelProps {
   tree: BroadcastTree;
@@ -19,7 +50,15 @@ interface SweepResult {
   error?: string;
 }
 
+interface SpendingTxOutput {
+  address?: string;
+  scriptType?: string;
+  value: number;
+  vout: number;
+}
+
 export function SweepPanel({ tree }: SweepPanelProps) {
+  const { state, findCoopExit } = useExit();
   const [mnemonic, setMnemonic] = useState('');
   const [account, setAccount] = useState(1);
   const [destination, setDestination] = useState('');
@@ -28,8 +67,59 @@ export function SweepPanel({ tree }: SweepPanelProps) {
   const [verifyResult, setVerifyResult] = useState<string | null>(null);
   const [sweepResults, setSweepResults] = useState<SweepResult[]>([]);
   const [step, setStep] = useState<'input' | 'verified' | 'done'>('input');
+  const [coopExitOutputs, setCoopExitOutputs] = useState<SpendingTxOutput[] | null>(null);
+  const [coopExitOutputsError, setCoopExitOutputsError] = useState<string | null>(null);
 
   const leafIds = tree.leaves.map(l => l.leafId);
+  const phase = state.treePhases[tree.treeId];
+  const coopExit = state.coopExitInfo[tree.treeId];
+
+  // For trees marked ALREADY_EXITED before coopExitInfo was being recorded,
+  // backfill the spending tx so the user can see where their funds went.
+  useEffect(() => {
+    if (phase === BroadcastPhase.ALREADY_EXITED && !coopExit) {
+      findCoopExit(tree.treeId);
+    }
+  }, [phase, coopExit, tree.treeId, findCoopExit]);
+
+  // Once we know the coop-exit spending txid, fetch its outputs from
+  // mempool.space so we can show the user exactly which addresses received
+  // funds — without needing them to leave the app.
+  useEffect(() => {
+    if (!coopExit?.spendingTxid) return;
+    let cancelled = false;
+    setCoopExitOutputsError(null);
+    const sources = [
+      `${PUBLIC_MEMPOOL_API}/tx/${coopExit.spendingTxid}`,
+      `/mempool/api/tx/${coopExit.spendingTxid}`,
+    ];
+    (async () => {
+      for (const url of sources) {
+        try {
+          const res = await fetch(url);
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (cancelled) return;
+          const outputs: SpendingTxOutput[] = (data.vout ?? []).map(
+            (o: { scriptpubkey_address?: string; scriptpubkey_type?: string; value: number }, i: number) => ({
+              address: o.scriptpubkey_address,
+              scriptType: o.scriptpubkey_type,
+              value: o.value,
+              vout: i,
+            }),
+          );
+          setCoopExitOutputs(outputs);
+          return;
+        } catch {
+          // try next source
+        }
+      }
+      if (!cancelled) setCoopExitOutputsError('Could not fetch spending tx');
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [coopExit?.spendingTxid]);
 
   const verify = async () => {
     if (!mnemonic.trim()) return;
@@ -74,55 +164,51 @@ export function SweepPanel({ tree }: SweepPanelProps) {
 
     for (const leafId of leafIds) {
       try {
-        // Look up the UTXO for this leaf's refund output
-        const decodeRes = await fetch('/decode-node', {
+        // Address-based discovery: derive the leaf p2tr address (the same one
+        // both the unilateral refund tx AND a Spark cooperative close pay to)
+        // and look up its UTXOs directly. The Spark SDK may hash the leaf id
+        // as utf8/utf8-no-dashes/uuid-bytes — /leaf-address returns one
+        // candidate per variant; we try each until we find UTXOs.
+        const addrRes = await fetch('/leaf-address', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            nodeHex: JSON.parse(
-              localStorage.getItem('unilateral-exit-state') ?? '{}'
-            ).importedData?.serializedNodes?.[leafId] ?? '',
-          }),
+          body: JSON.stringify({ mnemonic: mnemonic.trim(), leafId, account }),
         });
-        const node = await decodeRes.json();
+        const addrData = await addrRes.json();
+        if (!addrRes.ok || !Array.isArray(addrData.candidates)) {
+          results.push({ leafId, leafPath: '', utxoValue: 0, fee: 0, sendAmount: 0, txid: '', error: addrData.error || 'Could not derive leaf address' });
+          continue;
+        }
+        type Candidate = { variant: string; address?: string; derivationPath?: string; error?: string };
+        const candidates = addrData.candidates as Candidate[];
 
-        // Determine which refund tx was used (direct or cpfp)
-        // Try directRefundTx first, then refundTx
-        const refundHexes = [
-          node.directRefundTxHex,
-          node.directFromCpfpRefundTxHex,
-          node.refundTxHex,
-        ].filter((h: string) => h && h.length > 10);
-
-        let swept = false;
-        for (const refundHex of refundHexes) {
-          // Parse refund tx to find its txid and output value
-          const parseRes = await fetch('/decode-refund-tx', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ txHex: refundHex }),
-          });
-
-          if (!parseRes.ok) continue;
-          const parsed = await parseRes.json();
-
-          // Check if this refund tx is on-chain
-          const checkRes = await fetch(`/mempool/api/tx/${parsed.txid}`);
-          if (!checkRes.ok) continue;
-          const txData = await checkRes.json();
-          if (!txData.status?.confirmed) continue;
-
-          // Check if the output is still unspent
-          const outspendRes = await fetch(`/mempool/api/tx/${parsed.txid}/outspends`);
-          if (!outspendRes.ok) continue;
-          const outspends = await outspendRes.json();
-          if (outspends[0]?.spent) {
-            results.push({ leafId, leafPath: '', utxoValue: 0, fee: 0, sendAmount: 0, txid: '', error: 'Already swept' });
-            swept = true;
+        // Look up UTXOs at each candidate; pick the first one that has any.
+        let matched: { candidate: Candidate; utxos: Array<{ txid: string; vout: number; value: number }>; source: string } | null = null;
+        const triedSummaries: string[] = [];
+        for (const c of candidates) {
+          if (!c.address) continue;
+          const lookup = await fetchAddressUtxos(c.address);
+          if (!lookup.ok) {
+            triedSummaries.push(`${c.variant}=lookup-failed(${lookup.status})`);
+            continue;
+          }
+          if (lookup.utxos.length > 0) {
+            matched = { candidate: c, utxos: lookup.utxos, source: lookup.source };
             break;
           }
+          triedSummaries.push(`${c.variant}=empty(${c.address.slice(0, 14)}...)`);
+        }
 
-          // Sweep it
+        if (!matched) {
+          results.push({ leafId, leafPath: '', utxoValue: 0, fee: 0, sendAmount: 0, txid: '', error: `No UTXOs at any candidate address — tried: ${triedSummaries.join(', ')}` });
+          continue;
+        }
+
+        const leafPath = matched.candidate.derivationPath ?? '';
+        const hashVariant = matched.candidate.variant;
+
+        // Sweep each UTXO at the matched leaf address
+        for (const utxo of matched.utxos) {
           const sweepRes = await fetch('/sweep', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -130,10 +216,11 @@ export function SweepPanel({ tree }: SweepPanelProps) {
               mnemonic: mnemonic.trim(),
               leafId,
               account,
+              hashVariant,
               destinationAddress: destination.trim(),
-              utxoTxid: parsed.txid,
-              utxoVout: 0,
-              utxoValue: parsed.outputValue,
+              utxoTxid: utxo.txid,
+              utxoVout: utxo.vout,
+              utxoValue: utxo.value,
               feeRate,
               dryRun: false,
             }),
@@ -141,9 +228,8 @@ export function SweepPanel({ tree }: SweepPanelProps) {
           const sweepData = await sweepRes.json();
 
           if (sweepData.error) {
-            results.push({ leafId, leafPath: sweepData.leafPath || '', utxoValue: parsed.outputValue, fee: 0, sendAmount: 0, txid: '', error: sweepData.error });
-            swept = true;
-            break;
+            results.push({ leafId, leafPath: sweepData.leafPath || leafPath, utxoValue: utxo.value, fee: 0, sendAmount: 0, txid: '', error: sweepData.error });
+            continue;
           }
 
           // Broadcast
@@ -163,20 +249,11 @@ export function SweepPanel({ tree }: SweepPanelProps) {
               sendAmount: sweepData.sendAmount,
               txid: broadcastText.trim(),
             });
+          } else if (broadcastText.includes('-27')) {
+            results.push({ leafId, leafPath: sweepData.leafPath, utxoValue: sweepData.utxoValue, fee: sweepData.fee, sendAmount: sweepData.sendAmount, txid: sweepData.txid, error: 'Already broadcast' });
           } else {
-            // Check if already confirmed (-27)
-            if (broadcastText.includes('-27')) {
-              results.push({ leafId, leafPath: sweepData.leafPath, utxoValue: sweepData.utxoValue, fee: sweepData.fee, sendAmount: sweepData.sendAmount, txid: sweepData.txid, error: 'Already broadcast' });
-            } else {
-              results.push({ leafId, leafPath: sweepData.leafPath, utxoValue: sweepData.utxoValue, fee: 0, sendAmount: 0, txid: '', error: broadcastText });
-            }
+            results.push({ leafId, leafPath: sweepData.leafPath, utxoValue: utxo.value, fee: 0, sendAmount: 0, txid: '', error: broadcastText });
           }
-          swept = true;
-          break;
-        }
-
-        if (!swept) {
-          results.push({ leafId, leafPath: '', utxoValue: 0, fee: 0, sendAmount: 0, txid: '', error: 'Refund tx not found on-chain yet' });
         }
       } catch (e) {
         results.push({ leafId, leafPath: '', utxoValue: 0, fee: 0, sendAmount: 0, txid: '', error: e instanceof Error ? e.message : 'Unknown error' });
@@ -191,6 +268,75 @@ export function SweepPanel({ tree }: SweepPanelProps) {
   return (
     <div className="mt-3 p-3 rounded-lg border border-amber-700/50 bg-amber-950/20">
       <h3 className="text-sm font-semibold text-amber-400 mb-2">Sweep Funds</h3>
+
+      {phase === BroadcastPhase.ALREADY_EXITED && (
+        <div className="mb-3 p-2 rounded border border-blue-700/50 bg-blue-950/30">
+          <p className="text-[11px] text-blue-300 font-semibold mb-1">
+            Tree was cooperatively closed
+          </p>
+          <p className="text-[10px] text-zinc-400 mb-1.5">
+            Your refund tx was never broadcast — Spark spent the tree input directly
+            to the same leaf p2tr address that the unilateral refund would have paid
+            to (derivation <span className="font-mono">m/8797555&apos;/{`{account}`}&apos;/1&apos;/{`{leaf_child}`}&apos;</span>).
+            Verify your mnemonic and click <strong>Sweep</strong> below — the panel
+            will derive each leaf address and look up UTXOs there directly.
+          </p>
+          {coopExit && (
+            <div className="text-[10px]">
+              <p className="text-zinc-500">
+                Spent input: <span className="font-mono">{coopExit.prevTxid.slice(0, 16)}...:{coopExit.prevVout}</span>
+              </p>
+              <p className="text-zinc-500 mt-0.5">
+                Spending tx{coopExit.spendingBlockHeight ? ` (block ${coopExit.spendingBlockHeight})` : ''}:
+              </p>
+              <a
+                href={`${MEMPOOL_EXPLORER}/tx/${coopExit.spendingTxid}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-mono text-blue-400 underline hover:text-blue-300 break-all"
+              >
+                {coopExit.spendingTxid}
+              </a>
+
+              {coopExitOutputs && coopExitOutputs.length > 0 && (
+                <div className="mt-2 pt-2 border-t border-blue-900/50">
+                  <p className="text-zinc-400 mb-1">Outputs of that tx:</p>
+                  {coopExitOutputs.map(o => (
+                    <div key={o.vout} className="mb-1">
+                      <p className="text-zinc-500">
+                        vout {o.vout} — <span className="text-amber-400">{o.value.toLocaleString()} sats</span>
+                        {o.scriptType ? ` (${o.scriptType})` : ''}
+                      </p>
+                      {o.address ? (
+                        <a
+                          href={`${MEMPOOL_EXPLORER}/address/${o.address}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="font-mono text-blue-400 underline hover:text-blue-300 break-all"
+                        >
+                          {o.address}
+                        </a>
+                      ) : (
+                        <p className="font-mono text-zinc-600 italic">no address (non-standard script)</p>
+                      )}
+                    </div>
+                  ))}
+                  <p className="text-[9px] text-zinc-500 mt-2 italic">
+                    If any of these addresses is one you control, the funds are
+                    already in that wallet. Import the same mnemonic into a
+                    standard wallet (Sparrow / Electrum / BlueWallet, BIP84/BIP86)
+                    if you don&apos;t recognize the address — it may be one of your
+                    own L1 receive addresses derived from the same seed.
+                  </p>
+                </div>
+              )}
+              {coopExitOutputsError && (
+                <p className="text-red-400 mt-1">{coopExitOutputsError}</p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {step === 'input' && (
         <>

@@ -1,7 +1,7 @@
 'use client';
 
 import React, { createContext, useContext, useReducer, useEffect, useCallback, useRef } from 'react';
-import type { UniexitData, BroadcastTree, ExitState } from '@/lib/types';
+import type { UniexitData, BroadcastTree, ExitState, CoopExitInfo } from '@/lib/types';
 import { BroadcastPhase, StepStatus } from '@/lib/types';
 import { parseTreeState } from '@/lib/tree-parser';
 import { broadcastTx, submitPackage, getTxStatus, getCurrentBlockHeight, getFeeRate, determinePhase, getNextStep, checkOutspend } from '@/lib/broadcaster';
@@ -24,6 +24,7 @@ const initialState: ExitState = {
   stepErrors: {},
   csvTargetHeights: {},
   currentBlockHeight: 0,
+  coopExitInfo: {},
   isRunning: false,
   mempoolBaseUrl: DEFAULT_MEMPOOL_URL,
   rpcUrl: DEFAULT_RPC_URL,
@@ -44,7 +45,7 @@ type Action =
   | { type: 'UPDATE_BLOCK_HEIGHT'; height: number }
   | { type: 'TREE_PHASE_UPDATE'; treeId: string; phase: BroadcastPhase }
   | { type: 'TREE_COMPLETE'; treeId: string }
-  | { type: 'TREE_ALREADY_EXITED'; treeId: string; txids?: Record<string, string> }
+  | { type: 'TREE_ALREADY_EXITED'; treeId: string; txids?: Record<string, string>; coopExitInfo?: CoopExitInfo }
   | { type: 'CLEAR' };
 
 function reducer(state: ExitState, action: Action): ExitState {
@@ -141,11 +142,15 @@ function reducer(state: ExitState, action: Action): ExitState {
           }
         }
       }
+      const newCoopExitInfo = action.coopExitInfo
+        ? { ...state.coopExitInfo, [action.treeId]: action.coopExitInfo }
+        : state.coopExitInfo;
       return {
         ...state,
         treePhases: { ...state.treePhases, [action.treeId]: BroadcastPhase.ALREADY_EXITED },
         stepStatuses: newStatuses,
         stepTxids: newTxids,
+        coopExitInfo: newCoopExitInfo,
       };
     }
 
@@ -165,6 +170,7 @@ interface ExitContextValue {
   retryStep: (stepId: string) => void;
   bumpFee: (stepId: string) => void;
   clear: () => void;
+  findCoopExit: (treeId: string) => Promise<void>;
 }
 
 const ExitContext = createContext<ExitContextValue | null>(null);
@@ -183,6 +189,9 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
       if (saved) {
         dispatch({ type: 'LOAD_STATE', state: {
           ...saved,
+          // Backfill fields added after the initial release so old persisted state
+          // doesn't crash the reducer.
+          coopExitInfo: saved.coopExitInfo ?? {},
           isRunning: false,
           mempoolBaseUrl: DEFAULT_MEMPOOL_URL,
           rpcUrl: DEFAULT_RPC_URL,
@@ -224,13 +233,15 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
           const parsed = parseTx(leafStep!.txHex);
           const inp = parsed.inputs[0];
           const leafOutspend = await checkOutspend(inp.prevTxid, inp.prevVout, state.mempoolBaseUrl);
+          // Only proceed if we actually discovered the on-chain leaf-node tx.
+          // Otherwise we'd dispatch a no-op that re-creates treePhases and re-fires
+          // this effect forever, hammering /outspends.
+          if (!leafOutspend.spent || !leafOutspend.spendingTxid) return;
           const txids: Record<string, string> = {};
-          if (leafOutspend.spent && leafOutspend.spendingTxid) {
-            if (leafStep) txids[leafStep.id] = leafOutspend.spendingTxid;
-            const refundOutspend = await checkOutspend(leafOutspend.spendingTxid, 0, state.mempoolBaseUrl);
-            if (refundOutspend.spent && refundOutspend.spendingTxid && refundStep) {
-              txids[refundStep.id] = refundOutspend.spendingTxid;
-            }
+          if (leafStep) txids[leafStep.id] = leafOutspend.spendingTxid;
+          const refundOutspend = await checkOutspend(leafOutspend.spendingTxid, 0, state.mempoolBaseUrl);
+          if (refundOutspend.spent && refundOutspend.spendingTxid && refundStep) {
+            txids[refundStep.id] = refundOutspend.spendingTxid;
           }
           // Store intermediate txids we already have
           for (const st of tree.steps) {
@@ -238,9 +249,7 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
               txids[st.id] = state.stepTxids[st.id];
             }
           }
-          if (Object.keys(txids).length > 0) {
-            dispatch({ type: 'TREE_ALREADY_EXITED', treeId: tree.treeId, txids });
-          }
+          dispatch({ type: 'TREE_ALREADY_EXITED', treeId: tree.treeId, txids });
         } catch (e) {
           console.log(`[exit] could not look up exit txids for ${tree.treeId.slice(0,8)}: ${e instanceof Error ? e.message : e}`);
         }
@@ -511,6 +520,7 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
           } else if (result.error === 'missing-inputs') {
             // Check if the inputs were already spent (cooperative close)
             let alreadyExited = false;
+            let coopExitInfo: CoopExitInfo | undefined;
             try {
               const parsed = parseTx(nextStep.txHex);
               for (const inp of parsed.inputs) {
@@ -519,6 +529,14 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
                 if (outspend.spent) {
                   console.log(`[exit] input ${inp.prevTxid}:${inp.prevVout} already spent by ${outspend.spendingTxid} at block ${outspend.spendingBlockHeight} — tree already exited`);
                   alreadyExited = true;
+                  if (outspend.spendingTxid && !coopExitInfo) {
+                    coopExitInfo = {
+                      prevTxid: inp.prevTxid,
+                      prevVout: inp.prevVout,
+                      spendingTxid: outspend.spendingTxid,
+                      spendingBlockHeight: outspend.spendingBlockHeight,
+                    };
+                  }
                 } else {
                   console.log(`[exit] input ${inp.prevTxid}:${inp.prevVout} is NOT spent — UTXO may not exist`);
                 }
@@ -556,7 +574,7 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
               } catch (e) {
                 console.log(`[exit] could not look up exit txids: ${e instanceof Error ? e.message : e}`);
               }
-              dispatch({ type: 'TREE_ALREADY_EXITED', treeId: tree.treeId, txids: exitTxids });
+              dispatch({ type: 'TREE_ALREADY_EXITED', treeId: tree.treeId, txids: exitTxids, coopExitInfo });
               didWork = true;
             } else {
               dispatch({ type: 'STEP_FAILED', stepId: nextStep.id, error: 'Inputs not found on-chain' });
@@ -699,8 +717,40 @@ export function ExitProvider({ children }: { children: React.ReactNode }) {
     }
   }, [state.trees, state.mempoolBaseUrl, state.rpcUrl, state.rpcUser, state.rpcPassword]);
 
+  // Backfill: locate the on-chain tx that consumed an already-exited tree's input.
+  // Walks the deepest unbroadcast intermediate's input → spending tx, then follows
+  // single-output spends down the chain so we land on the leaf-most tx the user can
+  // actually inspect for their funds.
+  const findCoopExit = useCallback(async (treeId: string) => {
+    const s = stateRef.current;
+    const tree = s.trees.find(t => t.treeId === treeId);
+    if (!tree) return;
+    // Pick the deepest intermediate (or leaf-node if no intermediates) since that
+    // input is what gets spent first when Spark coop-closes the root.
+    const candidates = tree.steps
+      .filter(st => st.type === 'intermediate' || st.type === 'leaf-node')
+      .sort((a, b) => a.depth - b.depth);
+    if (candidates.length === 0) return;
+    const root = candidates[0];
+    try {
+      const parsed = parseTx(root.txHex);
+      const inp = parsed.inputs[0];
+      const outspend = await checkOutspend(inp.prevTxid, inp.prevVout, s.mempoolBaseUrl);
+      if (!outspend.spent || !outspend.spendingTxid) return;
+      const info: CoopExitInfo = {
+        prevTxid: inp.prevTxid,
+        prevVout: inp.prevVout,
+        spendingTxid: outspend.spendingTxid,
+        spendingBlockHeight: outspend.spendingBlockHeight,
+      };
+      dispatch({ type: 'TREE_ALREADY_EXITED', treeId, coopExitInfo: info });
+    } catch (e) {
+      console.log(`[exit] findCoopExit failed: ${e instanceof Error ? e.message : e}`);
+    }
+  }, []);
+
   return (
-    <ExitContext.Provider value={{ state, importData, startBroadcast, pause, retryStep, bumpFee, clear }}>
+    <ExitContext.Provider value={{ state, importData, startBroadcast, pause, retryStep, bumpFee, clear, findCoopExit }}>
       {children}
     </ExitContext.Provider>
   );
