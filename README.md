@@ -165,6 +165,10 @@ Each tree also has **direct** transaction variants (no anchor output, fee paid f
 - All pre-signed transactions are already signed with FROST threshold signatures and cannot be modified.
 - Sweep transactions are standard Taproot key-path spends signed with your derived private key.
 
+## SECURITY DISCLOSURES
+
+In the first instance please contact rob@stackedbitcoin.com and if no response in reasonable time please contact admin@stackedbitcoin.com
+
 ## License
 
 MIT
